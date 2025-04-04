@@ -1,42 +1,48 @@
 use crate::cursor_tracker::CursorTracker;
+use crate::helpers::db::resolve_heartbeat_ids;
 use crate::helpers::git::get_git_branch;
 use crate::monitored_app::{resolve_app_details, Entity, MonitoredApp, IGNORED_APPS};
 use crate::window_tracker::{Window, WindowTracker};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use log::{debug, info};
+use db::{heartbeats::Heartbeat as DBHeartbeat, DBContext};
+use log::{debug, error};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
-struct Heartbeat {
+pub struct Heartbeat {
     #[serde(with = "chrono::serde::ts_seconds_option")]
-    timestamp: Option<DateTime<Utc>>,
-    project_name: Option<String>,
-    project_path: Option<String>,
-    entity_name: String,
-    entity_type: Entity,
-    branch_name: Option<String>,
-    language_name: Option<String>,
-    app_name: String,
-    is_write: bool,
-    lines: Option<i64>,
-    cursor_x: Option<f64>,
-    cursor_y: Option<f64>,
+    pub timestamp: Option<DateTime<Utc>>,
+    pub project_name: Option<String>,
+    pub project_path: Option<String>,
+    pub entity_name: String,
+    pub entity_type: Entity,
+    pub branch_name: Option<String>,
+    pub language_name: Option<String>,
+    pub app_name: String,
+    pub is_write: bool,
+    pub lines: Option<i64>,
+    pub cursor_x: Option<f64>,
+    pub cursor_y: Option<f64>,
 }
 
 pub struct HeartbeatTracker {
     last_heartbeat: Arc<Mutex<Option<Heartbeat>>>,
     last_heartbeats: Arc<DashMap<(String, String), Instant>>, // (app_name, entity_name)
+    heartbeat_interval: Duration,
+    db: Arc<DBContext>,
 }
 
 impl HeartbeatTracker {
-    pub fn new() -> Self {
+    pub fn new(heartbeat_interval: u64, db: Arc<DBContext>) -> Self {
         let tracker = Self {
             last_heartbeat: Arc::new(Mutex::new(None)),
             last_heartbeats: Arc::new(DashMap::new()),
+            heartbeat_interval: Duration::from_secs(heartbeat_interval),
+            db,
         };
 
         let last_heartbeats_ref = Arc::clone(&tracker.last_heartbeats);
@@ -69,11 +75,10 @@ impl HeartbeatTracker {
 
     fn should_log_heartbeat(&self, app: &str, entity: &str) -> bool {
         let now = Instant::now();
-        let min_interval = Duration::from_secs(10);
 
         let key = (app.to_string(), entity.to_string());
         let should_log = match self.last_heartbeats.get(&key) {
-            Some(entry) => now.duration_since(*entry.value()) >= min_interval,
+            Some(entry) => now.duration_since(*entry.value()) >= self.heartbeat_interval,
             None => true,
         };
 
@@ -85,10 +90,11 @@ impl HeartbeatTracker {
     }
 
     /// Dynamically logs a heartbeat when user activity changes
-    pub fn track_heartbeat(
+    pub async fn track_heartbeat(
         &self,
         app_name: &str,
         app_bundle_id: &str,
+        app_path: &str,
         entity: &str,
         cursor_x: f64,
         cursor_y: f64,
@@ -96,13 +102,14 @@ impl HeartbeatTracker {
         let bundle_id = app_bundle_id
             .parse::<MonitoredApp>()
             .unwrap_or(MonitoredApp::Unknown);
+        let db = Arc::clone(&self.db);
 
         if IGNORED_APPS.contains(&bundle_id) {
             return;
         }
 
         let (project_name, project_path, entity_name, language_name, entity_type, _category) =
-            resolve_app_details(&bundle_id, entity);
+            resolve_app_details(&bundle_id, app_name, app_path.to_string(), entity);
 
         if !self.should_log_heartbeat(app_name, entity) {
             return;
@@ -138,7 +145,32 @@ impl HeartbeatTracker {
             cursor_y: Some(cursor_y),
         };
 
-        info!("Heartbeat logged: {:?}", heartbeat);
+        let resolved = resolve_heartbeat_ids(&db, heartbeat.clone())
+            .await
+            .unwrap_or_default();
+        let heartbeat_clone = heartbeat.clone();
+
+        let db_heartbeat = DBHeartbeat {
+            id: None,
+            project_id: resolved.project_id,
+            entity_id: resolved.entity_id,
+            branch_id: resolved.branch_id,
+            language_id: resolved.language_id,
+            app_id: resolved.app_id,
+            timestamp: heartbeat_clone.timestamp.unwrap_or_else(Utc::now),
+            is_write: Some(heartbeat_clone.is_write),
+            lines: heartbeat_clone.lines,
+            cursorpos: heartbeat_clone
+                .cursor_x
+                .map(|x| x as i64)
+                .or(heartbeat_clone.cursor_y.map(|y| y as i64)),
+        };
+
+        let _ = db_heartbeat
+            .create(&db)
+            .await
+            .map_err(|e| error!("Failed to insert heartbeat: {}", e));
+
         *self.last_heartbeat.lock().unwrap() = Some(heartbeat);
     }
 
@@ -152,8 +184,18 @@ impl HeartbeatTracker {
 
         cursor_tracker_ref.start_tracking({
             let heartbeat_tracker = Arc::clone(&heartbeat_tracker);
-            move |app_name, app_bundle_id, file, x, y| {
-                heartbeat_tracker.track_heartbeat(app_name, app_bundle_id, file, x, y);
+            move |app_name, app_bundle_id, app_path, file, x, y| {
+                let heartbeat_tracker = Arc::clone(&heartbeat_tracker);
+                let app_name = app_name.to_string();
+                let app_bundle_id = app_bundle_id.to_string();
+                let file = file.to_string();
+                let app_path = app_path.to_string();
+
+                tauri::async_runtime::spawn(async move {
+                    heartbeat_tracker
+                        .track_heartbeat(&app_name, &app_bundle_id, &app_path, &file, x, y)
+                        .await;
+                });
             }
         });
 
@@ -162,13 +204,23 @@ impl HeartbeatTracker {
             let heartbeat_tracker = Arc::clone(&heartbeat_tracker);
             move |window: Window| {
                 let cursor_position = cursor_tracker_ref.get_global_cursor_position();
-                heartbeat_tracker.track_heartbeat(
-                    &window.app_name,
-                    &window.bundle_id,
-                    &window.title,
-                    cursor_position.0,
-                    cursor_position.1,
-                );
+                let heartbeat_tracker = Arc::clone(&heartbeat_tracker);
+                let app_name = window.app_name.clone();
+                let bundle_id = window.bundle_id.clone();
+                let app_path = window.path;
+                let title = window.title.clone();
+                tauri::async_runtime::spawn(async move {
+                    heartbeat_tracker
+                        .track_heartbeat(
+                            &app_name,
+                            &bundle_id,
+                            &app_path,
+                            &title,
+                            cursor_position.0,
+                            cursor_position.1,
+                        )
+                        .await;
+                });
             }
         }) as Arc<dyn Fn(Window) + Send + Sync>);
     }

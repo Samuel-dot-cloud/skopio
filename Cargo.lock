@@ -172,9 +172,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.95"
+version = "1.0.97"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34ac096ce696dc2fcabef30516bb13c0a68a11d30131d3df6f04711467681b04"
+checksum = "dcfed56ad506cb2c684a14971b8861fdc3baaaae314b9e5f9bb532cbe3ba7a4f"
 
 [[package]]
 name = "arrayvec"
@@ -1029,6 +1029,7 @@ name = "db"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "log",
  "serde",
  "sqlx",
 ]
@@ -1071,11 +1072,13 @@ dependencies = [
 name = "desktop"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "chrono",
  "cocoa",
  "core-foundation 0.10.0",
  "core-graphics",
  "dashmap 6.1.0",
+ "db",
  "log",
  "objc2 0.6.0",
  "serde",
@@ -1087,6 +1090,7 @@ dependencies = [
  "tauri-plugin-log",
  "tokei",
  "tokio",
+ "url",
 ]
 
 [[package]]
@@ -3323,9 +3327,9 @@ dependencies = [
 
 [[package]]
 name = "once_cell"
-version = "1.20.3"
+version = "1.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "945462a4b81e43c4e3ba96bd7b49d834c6f61198356aa858733bc4acf3cbe62e"
+checksum = "42f5e15c9953c5e4ccceeb2e7382a716482c34515315f7b03532b8b4e8393d2d"
 
 [[package]]
 name = "openssl"
