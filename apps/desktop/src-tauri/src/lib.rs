@@ -1,8 +1,3 @@
-use crate::afk_tracker::AFKTracker;
-use crate::cursor_tracker::CursorTracker;
-use crate::event_tracker::EventTracker;
-use crate::heartbeat_tracker::HeartbeatTracker;
-use crate::window_tracker::WindowTracker;
 use buffered_service::BufferedTrackingService;
 use chrono::Local;
 use db::DBContext;
@@ -10,22 +5,21 @@ use helpers::{
     config::{AppConfig, CONFIG},
     db::get_db_path,
 };
-use keyboard_tracker::KeyboardTracker;
 use log::error;
 use std::sync::Arc;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, Runtime};
+use trackers::{
+    afk_tracker::AFKTracker, cursor_tracker::CursorTracker, event_tracker::EventTracker,
+    heartbeat_tracker::HeartbeatTracker, keyboard_tracker::KeyboardTracker,
+    window_tracker::WindowTracker,
+};
 use tracking_service::{DBService, TrackingService};
 
-mod afk_tracker;
 mod buffered_service;
-mod cursor_tracker;
-mod event_tracker;
-mod heartbeat_tracker;
 mod helpers;
-mod keyboard_tracker;
 mod monitored_app;
+mod trackers;
 mod tracking_service;
-mod window_tracker;
 
 #[tokio::main]
 pub async fn run() {
@@ -34,12 +28,17 @@ pub async fn run() {
     let cursor_tracker = Arc::new(CursorTracker::new());
     let keyboard_tracker = Arc::new(KeyboardTracker::new());
     let window_tracker = Arc::new(WindowTracker::new());
+
+    let specta_builder = make_specta_builder();
+
     tauri::Builder::default()
         .manage(Arc::clone(&cursor_tracker))
         .manage(Arc::clone(&keyboard_tracker))
         .manage(Arc::clone(&window_tracker))
-        .setup(|app| {
-            let app_handle = app.handle();
+        .setup(move |app| {
+            let app_handle = app.handle().clone();
+
+            specta_builder.mount_events(&app_handle);
             // Enable logging in debug mode
             if cfg!(debug_assertions) {
                 app_handle.plugin(
@@ -63,8 +62,8 @@ pub async fn run() {
             }
 
             let app_handle_clone = app_handle.clone();
-            tokio::spawn(async move {
-                if let Err(e) = async_setup(&app_handle_clone).await {
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = setup_trackers(&app_handle_clone).await {
                     error!("Failed async setup: {}", e);
                 }
             });
@@ -85,24 +84,25 @@ pub async fn run() {
                 });
             }
         })
-        .invoke_handler(tauri::generate_handler![
-            crate::helpers::config::get_config,
-            crate::helpers::config::set_theme,
-            crate::helpers::config::set_afk_timeout,
-            crate::helpers::config::set_heartbeat_interval,
-        ])
         .run(tauri::generate_context!())
         .expect("Error while running Tauri application");
 }
 
-async fn async_setup(app_handle: &AppHandle) -> Result<(), anyhow::Error> {
-    let config = AppConfig::load(app_handle)?;
-    *CONFIG.lock().unwrap() = config.clone();
+async fn setup_trackers(app_handle: &AppHandle) -> Result<(), anyhow::Error> {
+    AppConfig::load(app_handle)
+        .await
+        .unwrap_or_else(|e| error!("Failed to load app config: {}", e));
+
+    let config = Arc::clone(&CONFIG);
 
     let db_path = get_db_path(app_handle);
     let db_url = format!("sqlite://{}", db_path.to_str().unwrap());
 
-    let db = match DBContext::new(&db_url).await {
+    let db_result = tokio::spawn(async move { DBContext::new(&db_url).await })
+        .await
+        .expect("DB task panicked");
+
+    let db = match db_result {
         Ok(db) => Arc::new(db),
         Err(err) => {
             error!("Failed to connect to database: {}", err);
@@ -122,18 +122,18 @@ async fn async_setup(app_handle: &AppHandle) -> Result<(), anyhow::Error> {
     let afk_tracker = Arc::new(AFKTracker::new(
         Arc::clone(&cursor_tracker),
         Arc::clone(&keyboard_tracker),
-        config.afk_timeout,
+        Arc::clone(&config),
         Arc::clone(&service_trait),
     ));
 
     let heartbeat_tracker = Arc::new(HeartbeatTracker::new(
-        config.heartbeat_interval,
+        Arc::clone(&config),
         Arc::clone(&service_trait),
     ));
     let event_tracker = Arc::new(EventTracker::new(
         Arc::clone(&cursor_tracker),
         Arc::clone(&keyboard_tracker),
-        config.afk_timeout,
+        Arc::clone(&config),
         Arc::clone(&service_trait),
     ));
 
@@ -169,4 +169,28 @@ async fn async_setup(app_handle: &AppHandle) -> Result<(), anyhow::Error> {
     });
 
     Ok(())
+}
+
+fn make_specta_builder<R: Runtime>() -> tauri_specta::Builder<R> {
+    let builder = tauri_specta::Builder::<R>::new()
+        .commands(tauri_specta::collect_commands![
+            crate::helpers::config::get_config,
+            crate::helpers::config::set_theme::<tauri::Wry>,
+            crate::helpers::config::set_afk_timeout::<tauri::Wry>,
+            crate::helpers::config::set_heartbeat_interval::<tauri::Wry>,
+        ])
+        .error_handling(tauri_specta::ErrorHandlingMode::Throw);
+
+    #[cfg(debug_assertions)]
+    builder
+        .export(
+            specta_typescript::Typescript::default()
+                .formatter(specta_typescript::formatter::prettier)
+                .bigint(specta_typescript::BigIntExportBehavior::Number)
+                .header("/* eslint-disable */\n// @ts-nocheck\n\n"),
+            "../src/types/tauri.gen.ts",
+        )
+        .expect("Failed to export typescript bindings");
+
+    builder
 }
