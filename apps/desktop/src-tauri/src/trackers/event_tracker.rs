@@ -1,10 +1,7 @@
-use crate::cursor_tracker::CursorTracker;
 use crate::helpers::db::to_naive_datetime;
 use crate::helpers::git::get_git_branch;
-use crate::keyboard_tracker::KeyboardTracker;
 use crate::monitored_app::{resolve_app_details, Category, Entity, MonitoredApp, IGNORED_APPS};
 use crate::tracking_service::TrackingService;
-use crate::window_tracker::Window;
 use chrono::{DateTime, Utc};
 use db::desktop::events::Event as DBEvent;
 use log::{error, info};
@@ -12,6 +9,10 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::{watch, Mutex};
 use tokio::time::{Duration, Instant};
+
+use super::keyboard_tracker::KeyboardTracker;
+use super::mouse_tracker::MouseTracker;
+use super::window_tracker::Window;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Event {
@@ -33,17 +34,17 @@ pub struct Event {
 pub struct EventTracker {
     active_event: Arc<Mutex<Option<Event>>>,
     last_activity: Arc<Mutex<Instant>>,
-    cursor_tracker: Arc<CursorTracker>,
+    cursor_tracker: Arc<MouseTracker>,
     keyboard_tracker: Arc<KeyboardTracker>,
-    afk_threshold: Duration,
+    afk_timeout_rx: watch::Receiver<u64>,
     tracker: Arc<dyn TrackingService>,
 }
 
 impl EventTracker {
     pub fn new(
-        cursor_tracker: Arc<CursorTracker>,
+        cursor_tracker: Arc<MouseTracker>,
         keyboard_tracker: Arc<KeyboardTracker>,
-        afk_timeout: u64,
+        afk_timeout_rx: watch::Receiver<u64>,
         tracker: Arc<dyn TrackingService>,
     ) -> Self {
         Self {
@@ -51,7 +52,7 @@ impl EventTracker {
             last_activity: Arc::new(Mutex::new(Instant::now())),
             cursor_tracker,
             keyboard_tracker,
-            afk_threshold: Duration::from_secs(afk_timeout),
+            afk_timeout_rx,
             tracker,
         }
     }
@@ -154,7 +155,6 @@ impl EventTracker {
         tokio::spawn(async move {
             let mut last_state = None;
             let mut last_check = Instant::now();
-            let afk_threshold = self.afk_threshold;
 
             loop {
                 tokio::select! {
@@ -197,8 +197,11 @@ impl EventTracker {
                         }
                     }
 
-                    _ = tokio::time::sleep_until(last_check + afk_threshold) => {
+                    _ = tokio::time::sleep_until(last_check + {
+                        Duration::from_secs(*self.afk_timeout_rx.borrow())
+                    }) => {
                         let last_active_time = *self.last_activity.lock().await;
+                        let afk_threshold = Duration::from_secs(*self.afk_timeout_rx.borrow());
                         if Instant::now().duration_since(last_active_time) >= afk_threshold {
                             self.end_active_event().await;
                             last_state = None;

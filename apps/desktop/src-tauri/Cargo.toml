@@ -20,7 +20,7 @@ tauri-build = { version = "2.0.2", features = [] }
 serde_json = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 log = { workspace = true }
-tauri = { version = "2.1.0", features = ["objc-exception"] }
+tauri = { version = "2.1.0", features = ["objc-exception", "specta"] }
 tauri-plugin-log = "2.0.0-rc"
 chrono = { workspace = true, features = ["serde"] }
 cocoa = "0.26.0"
@@ -39,5 +39,9 @@ async-trait = { workspace = true }
 url = "2.5.4"
 console-subscriber = "0.4.1"
 reqwest = { workspace = true, features = ["json", "rustls-tls"] }
+
+specta = { workspace = true }
+specta-typescript = { workspace = true }
+tauri-specta = { workspace = true, features = ["derive", "typescript"] }
 
 db = { path = "../../../crates/db", features = ["desktop"] }

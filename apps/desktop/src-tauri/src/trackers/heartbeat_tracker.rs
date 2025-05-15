@@ -1,9 +1,7 @@
-use crate::cursor_tracker::CursorActivity;
 use crate::helpers::db::to_naive_datetime;
 use crate::helpers::git::get_git_branch;
 use crate::monitored_app::{resolve_app_details, Entity, MonitoredApp, IGNORED_APPS};
 use crate::tracking_service::TrackingService;
-use crate::window_tracker::Window;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use db::desktop::heartbeats::Heartbeat as DBHeartbeat;
@@ -13,6 +11,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tokio::time::{interval, Duration as TokioDuration};
+
+use super::mouse_tracker::CursorPosition;
+use super::window_tracker::Window;
 
 #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
 pub struct Heartbeat {
@@ -34,16 +35,19 @@ pub struct Heartbeat {
 pub struct HeartbeatTracker {
     last_heartbeat: Arc<Mutex<Option<Heartbeat>>>,
     last_heartbeats: Arc<DashMap<(String, String), Instant>>, // (app_name, entity_name)
-    heartbeat_interval: Duration,
+    heartbeat_interval_rx: watch::Receiver<u64>,
     tracker: Arc<dyn TrackingService>,
 }
 
 impl HeartbeatTracker {
-    pub fn new(heartbeat_interval: u64, tracker: Arc<dyn TrackingService>) -> Self {
+    pub fn new(
+        heartbeat_interval_rx: watch::Receiver<u64>,
+        tracker: Arc<dyn TrackingService>,
+    ) -> Self {
         let tracker = Self {
             last_heartbeat: Arc::new(Mutex::new(None)),
             last_heartbeats: Arc::new(DashMap::new()),
-            heartbeat_interval: Duration::from_secs(heartbeat_interval),
+            heartbeat_interval_rx,
             tracker,
         };
 
@@ -78,12 +82,13 @@ impl HeartbeatTracker {
         );
     }
 
-    fn should_log_heartbeat(&self, app: &str, entity: &str) -> bool {
+    async fn should_log_heartbeat(&self, app: &str, entity: &str) -> bool {
         let now = Instant::now();
-
         let key = (app.to_string(), entity.to_string());
+
+        let interval = Duration::from_secs(*self.heartbeat_interval_rx.borrow());
         let should_log = match self.last_heartbeats.get(&key) {
-            Some(entry) => now.duration_since(*entry.value()) >= self.heartbeat_interval,
+            Some(entry) => now.duration_since(*entry.value()) >= interval,
             None => true,
         };
 
@@ -115,7 +120,7 @@ impl HeartbeatTracker {
         let (project_name, project_path, entity_name, language_name, entity_type, _category) =
             resolve_app_details(&bundle_id, app_name, app_path, entity);
 
-        if !self.should_log_heartbeat(app_name, entity) {
+        if !self.should_log_heartbeat(app_name, entity).await {
             return;
         }
 
@@ -179,7 +184,7 @@ impl HeartbeatTracker {
 
     pub async fn start_tracking(
         self: Arc<Self>,
-        cursor_rx: watch::Receiver<Option<CursorActivity>>,
+        cursor_rx: watch::Receiver<Option<CursorPosition>>,
         mut window_rx: watch::Receiver<Option<Window>>,
     ) {
         let tracker = Arc::clone(&self);
