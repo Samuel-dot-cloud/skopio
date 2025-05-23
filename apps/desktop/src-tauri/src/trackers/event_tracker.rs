@@ -1,10 +1,7 @@
-use crate::cursor_tracker::CursorTracker;
 use crate::helpers::db::to_naive_datetime;
 use crate::helpers::git::get_git_branch;
-use crate::keyboard_tracker::KeyboardTracker;
 use crate::monitored_app::{resolve_app_details, Category, Entity, MonitoredApp, IGNORED_APPS};
 use crate::tracking_service::TrackingService;
-use crate::window_tracker::Window;
 use chrono::{DateTime, Utc};
 use db::desktop::events::Event as DBEvent;
 use log::{error, info};
@@ -12,6 +9,10 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::{watch, Mutex};
 use tokio::time::{Duration, Instant};
+
+use super::keyboard_tracker::KeyboardTracker;
+use super::mouse_tracker::MouseTracker;
+use super::window_tracker::Window;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Event {
@@ -33,17 +34,15 @@ pub struct Event {
 pub struct EventTracker {
     active_event: Arc<Mutex<Option<Event>>>,
     last_activity: Arc<Mutex<Instant>>,
-    cursor_tracker: Arc<CursorTracker>,
+    cursor_tracker: Arc<MouseTracker>,
     keyboard_tracker: Arc<KeyboardTracker>,
-    afk_threshold: Duration,
     tracker: Arc<dyn TrackingService>,
 }
 
 impl EventTracker {
     pub fn new(
-        cursor_tracker: Arc<CursorTracker>,
+        cursor_tracker: Arc<MouseTracker>,
         keyboard_tracker: Arc<KeyboardTracker>,
-        afk_timeout: u64,
         tracker: Arc<dyn TrackingService>,
     ) -> Self {
         Self {
@@ -51,7 +50,6 @@ impl EventTracker {
             last_activity: Arc::new(Mutex::new(Instant::now())),
             cursor_tracker,
             keyboard_tracker,
-            afk_threshold: Duration::from_secs(afk_timeout),
             tracker,
         }
     }
@@ -150,13 +148,16 @@ impl EventTracker {
     pub fn start_tracking(
         self: Arc<Self>,
         mut window_rx: watch::Receiver<Option<Window>>,
+        mut afk_timeout_rx: watch::Receiver<u64>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut last_state = None;
             let mut last_check = Instant::now();
-            let afk_threshold = self.afk_threshold;
 
             loop {
+                let afk_timeout_secs = *afk_timeout_rx.borrow_and_update();
+                let afk_threshold = Duration::from_secs(afk_timeout_secs);
+
                 tokio::select! {
                     changed = window_rx.changed() => {
                         if changed.is_err() {
