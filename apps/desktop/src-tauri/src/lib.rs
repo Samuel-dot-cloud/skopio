@@ -11,12 +11,15 @@ use trackers::{
 };
 use tracking_service::{DBService, TrackingService};
 
+use crate::ui::tray::init_tray;
+
 mod helpers;
 mod monitored_app;
 mod summaries;
 mod sync_service;
 mod trackers;
 mod tracking_service;
+mod ui;
 
 #[tokio::main]
 pub async fn run() {
@@ -62,12 +65,30 @@ pub async fn run() {
                 )?;
             }
 
+            #[cfg(target_os = "macos")]
+            {
+                let window = app_handle.get_webview_window("main").unwrap();
+                let ns_window = window.ns_window().unwrap();
+                unsafe {
+                    use crate::ui::toolbar::{adjust_traffic_light_position, customize_toolbar};
+                    use objc2::runtime::AnyObject;
+                    use objc2_app_kit::NSWindow;
+
+                    let window: *mut AnyObject = ns_window as *mut AnyObject;
+                    let ns_window: &NSWindow = &*(window as *const NSWindow);
+                    customize_toolbar(ns_window);
+                    adjust_traffic_light_position(ns_window);
+                }
+            }
+
             let app_handle_clone = app_handle.clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = setup_trackers(&app_handle_clone).await {
                     error!("Failed async setup: {}", e);
                 }
             });
+
+            init_tray(app)?;
 
             Ok(())
         })
@@ -83,6 +104,26 @@ pub async fn run() {
                 tokio::spawn(async move {
                     buffered_service.shutdown().await;
                 });
+            }
+
+            if matches!(
+                event,
+                tauri::WindowEvent::Resized(_) | tauri::WindowEvent::Moved(_)
+            ) {
+                #[cfg(target_os = "macos")]
+                {
+                    use crate::ui::toolbar::adjust_traffic_light_position;
+                    use objc2::runtime::AnyObject;
+                    use objc2_app_kit::NSWindow;
+
+                    unsafe {
+                        let ns_window = window.ns_window().unwrap();
+                        let window: *mut AnyObject = ns_window as *mut AnyObject;
+                        let ns_window: &NSWindow = &*(window as *const NSWindow);
+
+                        adjust_traffic_light_position(ns_window);
+                    }
+                }
             }
         })
         .plugin(tauri_plugin_dialog::init())
