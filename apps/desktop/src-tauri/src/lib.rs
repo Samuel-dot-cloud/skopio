@@ -13,7 +13,10 @@ use tracking_service::{DBService, TrackingService};
 
 use crate::{
     goals_service::GoalService,
-    ui::{notification::NotificationPayload, tray::init_tray},
+    ui::{
+        tray::init_tray,
+        window::{NotificationPayload, WindowExt, WindowKind},
+    },
 };
 
 mod goals_service;
@@ -69,28 +72,14 @@ pub async fn run() {
                 )?;
             }
 
-            #[cfg(target_os = "macos")]
-            {
-                let window = app_handle.get_webview_window("main").unwrap();
-                let ns_window = window.ns_window().unwrap();
-                unsafe {
-                    use crate::ui::toolbar::{adjust_traffic_light_position, customize_toolbar};
-                    use objc2::runtime::AnyObject;
-                    use objc2_app_kit::NSWindow;
-
-                    let window: *mut AnyObject = ns_window as *mut AnyObject;
-                    let ns_window: &NSWindow = &*(window as *const NSWindow);
-                    customize_toolbar(ns_window);
-                    adjust_traffic_light_position(ns_window);
-                }
-            }
-
             let app_handle_clone = app_handle.clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = setup_trackers(&app_handle_clone).await {
                     error!("Failed async setup: {}", e);
                 }
             });
+
+            app_handle.show_window(WindowKind::Main)?;
 
             init_tray(app)?;
 
@@ -127,28 +116,13 @@ pub async fn run() {
                     });
                 }
             }
-
-            if matches!(
-                event,
-                tauri::WindowEvent::Resized(_) | tauri::WindowEvent::Moved(_)
-            ) {
-                #[cfg(target_os = "macos")]
-                {
-                    use crate::ui::toolbar::adjust_traffic_light_position;
-                    use objc2::runtime::AnyObject;
-                    use objc2_app_kit::NSWindow;
-
-                    unsafe {
-                        let ns_window = window.ns_window().unwrap();
-                        let window: *mut AnyObject = ns_window as *mut AnyObject;
-                        let ns_window: &NSWindow = &*(window as *const NSWindow);
-
-                        adjust_traffic_light_position(ns_window);
-                    }
-                }
-            }
         })
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .run(tauri::generate_context!())
         .expect("Error while running Tauri application");
 }
@@ -172,7 +146,7 @@ async fn setup_trackers(app_handle: &AppHandle) -> Result<(), anyhow::Error> {
         }
     };
 
-    app_handle.manage(db.clone());
+    app_handle.manage::<Arc<DBContext>>(db.clone());
 
     let raw_service = Arc::new(DBService::new(Arc::clone(&db)));
     let sync_interval_rx = config_store.subscribe_sync_interval();
@@ -260,6 +234,7 @@ fn make_specta_builder<R: Runtime>() -> tauri_specta::Builder<R> {
             crate::helpers::config::set_theme::<tauri::Wry>,
             crate::helpers::config::set_afk_timeout::<tauri::Wry>,
             crate::helpers::config::set_heartbeat_interval::<tauri::Wry>,
+            crate::helpers::config::set_global_shortcut::<tauri::Wry>,
             crate::network::summaries::fetch_bucketed_summary,
             crate::network::summaries::fetch_total_time,
             crate::network::summaries::fetch_range_summary,
@@ -274,7 +249,8 @@ fn make_specta_builder<R: Runtime>() -> tauri_specta::Builder<R> {
             crate::network::data::search_projects,
             crate::network::insights::fetch_insights,
             crate::network::events::fetch_events,
-            crate::ui::notification::dismiss_notification_window::<tauri::Wry>,
+            crate::ui::window::dismiss_notification_window::<tauri::Wry>,
+            crate::ui::window::show_settings_window::<tauri::Wry>,
         ])
         .error_handling(tauri_specta::ErrorHandlingMode::Throw)
         .typ::<NotificationPayload>();
